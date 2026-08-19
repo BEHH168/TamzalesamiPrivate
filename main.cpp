@@ -1,342 +1,410 @@
-//by @gametocytes @pastercode
-#include "core.hpp"
-#include "hooking.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <cstdarg>
+#include <string>
+#include <vector>
+#include <map>
+#include <fcntl.h>
+#include <unistd.h>
+#include <elf.h>
+#include <sys/mman.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <sys/uio.h>
+#include <cerrno>
 
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
+#define PGSZ ((uint64_t)sysconf(_SC_PAGESIZE))
+static inline uint64_t alu(uint64_t x){ return (x+PGSZ-1)&~(PGSZ-1); }
+static inline uint64_t ald(uint64_t x){ return x&~(PGSZ-1); }
 
-extern "C" {
-__attribute__((visibility("hidden"), used)) void* memset(void* s, int c, size_t n) {
-    unsigned char* p = (unsigned char*)s;
-    unsigned char v = (unsigned char)c;
-    while (n--) *p++ = v;
-    return s;
+static int mfd=-1;
+
+static void logf(const char* f,...){
+    (void)f;
 }
-__attribute__((visibility("hidden"), used)) void* memcpy(void* d, const void* s, size_t n) {
-    unsigned char* dd = (unsigned char*)d;
-    const unsigned char* ss = (const unsigned char*)s;
-    while (n--) *dd++ = *ss++;
-    return d;
+
+// aarch64 user regs
+struct pr64{ uint64_t regs[31]; uint64_t sp; uint64_t pc; uint64_t pstate; };
+
+static int getregs(int pid,pr64* r){
+    iovec iov; iov.iov_base=r; iov.iov_len=sizeof(*r);
+    errno=0;
+    return ptrace(PTRACE_GETREGSET,pid,(void*)NT_PRSTATUS,&iov)==0?0:-1;
 }
-__attribute__((visibility("hidden"), used)) void* memmove(void* d, const void* s, size_t n) {
-    unsigned char* dd = (unsigned char*)d;
-    const unsigned char* ss = (const unsigned char*)s;
-    if (dd < ss) { while (n--) *dd++ = *ss++; }
-    else { dd += n; ss += n; while (n--) *--dd = *--ss; }
-    return d;
+static int setregs(int pid,pr64* r){
+    iovec iov; iov.iov_base=r; iov.iov_len=sizeof(*r);
+    errno=0;
+    return ptrace(PTRACE_SETREGSET,pid,(void*)NT_PRSTATUS,&iov)==0?0:-1;
 }
-__attribute__((visibility("hidden"), used)) int memcmp(const void* a, const void* b, size_t n) {
-    const unsigned char* x = (const unsigned char*)a;
-    const unsigned char* y = (const unsigned char*)b;
-    while (n--) { if (*x != *y) return (int)*x - (int)*y; x++; y++; }
+
+static uintptr_t rcall(int pid,uintptr_t fn,int n,uintptr_t a0=0,uintptr_t a1=0,uintptr_t a2=0,uintptr_t a3=0,uintptr_t a4=0,uintptr_t a5=0){
+    if(ptrace(PTRACE_ATTACH,pid,0,0)==-1){ logf("[-] attach %s\n",strerror(errno)); return (uintptr_t)-1; }
+    int st=0;
+    for(int k=0;k<200;k++){ waitpid(pid,&st,__WALL); if((st&0xff)==0x7f) break; }
+    pr64 r_,o;
+    if(getregs(pid,&r_)==-1){ ptrace(PTRACE_DETACH,pid,0,0); return (uintptr_t)-1; }
+    o=r_;
+    uintptr_t a[6]={a0,a1,a2,a3,a4,a5};
+    for(int i=0;i<n&&i<6;i++) r_.regs[i]=a[i];
+    r_.pc=fn;
+    r_.regs[30]=0;
+    if(setregs(pid,&r_)==-1){ ptrace(PTRACE_DETACH,pid,0,0); return (uintptr_t)-1; }
+    if(ptrace(PTRACE_CONT,pid,0,0)==-1){ ptrace(PTRACE_DETACH,pid,0,0); return (uintptr_t)-1; }
+    for(int k=0;k<400;k++){
+        waitpid(pid,&st,__WALL);
+        if((st&0xff)==0x7f) break;
+        if(ptrace(PTRACE_CONT,pid,0,0)==-1) break;
+    }
+    pr64 res;
+    if(getregs(pid,&res)==-1){ ptrace(PTRACE_DETACH,pid,0,0); return (uintptr_t)-1; }
+    uintptr_t ret=res.regs[0];
+    setregs(pid,&o);
+    ptrace(PTRACE_DETACH,pid,0,0);
+    return ret;
+}
+
+static ssize_t rread(uint64_t a,void* b,size_t n){ return pread(mfd,b,n,(off_t)a); }
+static ssize_t rwrite(uint64_t a,const void* b,size_t n){ return pwrite(mfd,b,n,(off_t)a); }
+
+struct seg{ uint64_t va,fsz,msz,off,al; uint32_t fl; };
+static uint64_t v2o(const std::vector<seg>& S,uint64_t va){
+    for(size_t i=0;i<S.size();i++) if(va>=S[i].va&&va<S[i].va+S[i].msz) return S[i].off+(va-S[i].va);
     return 0;
 }
-__attribute__((visibility("hidden"), used)) void* memchr(const void* s, int c, size_t n) {
-    const unsigned char* p = (const unsigned char*)s;
-    unsigned char v = (unsigned char)c;
-    while (n--) { if (*p == v) return (void*)p; p++; }
-    return nullptr;
-}
-__attribute__((visibility("hidden"), used)) size_t strlen(const char* s) {
-    size_t n = 0;
-    while (s[n]) n++;
-    return n;
-}
-__attribute__((visibility("hidden"), used)) int strcmp(const char* a, const char* b) {
-    while (*a && *a == *b) { a++; b++; }
-    return (int)(unsigned char)*a - (int)(unsigned char)*b;
-}
-__attribute__((visibility("hidden"), used)) int strncmp(const char* a, const char* b, size_t n) {
-    while (n && *a && *a == *b) { a++; b++; n--; }
-    return n ? (int)(unsigned char)*a - (int)(unsigned char)*b : 0;
-}
-__attribute__((visibility("hidden"), used)) char* strstr(const char* h, const char* n) {
-    if (!*n) return (char*)h;
-    for (; *h; h++) {
-        const char* a = h;
-        const char* b = n;
-        while (*b && *a == *b) { a++; b++; }
-        if (!*b) return (char*)h;
-    }
-    return nullptr;
-}
-}
 
-struct lib_seg { uint64_t va, foff, size, vaddr; bool exec, forge; };
-static std::vector<lib_seg> g_segs;
-static std::once_flag g_segs_once;
-
-static void build_segs() {
-    g_segs.clear();
-    size_t n = 0;
-    char* buf = load_maps_full(&n);
-    if (!buf) return;
-    char* p = buf;
-    while (*p) {
-        char* le = p;
-        while (*le && *le != '\n') le++;
-        if (*le) *le = 0;
-        uint64_t st = 0, en = 0, off = 0;
-        int k = 0;
-        while (ishex(p[k])) { st = st * 16 + (uint64_t)hexv(p[k]); k++; }
-        if (p[k] == '-') {
-            k++;
-            while (ishex(p[k])) { en = en * 16 + (uint64_t)hexv(p[k]); k++; }
-        }
-        while (p[k] == ' ') k++;
-        bool exec = (p[k] == 'r' && p[k + 2] == 'x');
-        for (int i = 0; i < 4 && p[k]; i++) k++;
-        while (p[k] == ' ') k++;
-        while (ishex(p[k])) { off = off * 16 + (uint64_t)hexv(p[k]); k++; }
-        const char* q = p;
-        while (*q && *q != '/') q++;
-        if (*q == '/' && strstr(q, "libunity.so") && en > st)
-            g_segs.push_back({st, off, en - st, 0, exec, false});
-        p = le + 1;
-    }
-    free(buf);
-
-    uint64_t max_end = 0;
-    for (auto& s : g_segs)
-        if (s.foff + s.size > max_end) max_end = s.foff + s.size;
-
-    uint64_t load_bias = 0;
-    for (auto& s : g_segs) {
-        if (s.foff == 0) {
-            if (max_end && s.foff + s.size == max_end) s.forge = true;
-            if (!s.forge) load_bias = s.va;
-        }
-    }
-    if (!load_bias)
-        for (auto& s : g_segs)
-            if (s.foff == 0 && !s.forge && (!load_bias || s.va < load_bias)) load_bias = s.va;
-    if (!load_bias && !g_segs.empty()) load_bias = g_segs[0].va;
-
-    for (auto& s : g_segs)
-        if (!s.forge) s.vaddr = s.va - load_bias;
-}
-
-static void* segment_resolve_rva(uint64_t rva) {
-    std::call_once(g_segs_once, build_segs);
-    void* any = nullptr;
-    for (size_t i = 0; i < g_segs.size(); i++) {
-        const lib_seg& s = g_segs[i];
-        if (s.forge || !s.size) continue;
-        if (rva < s.vaddr || rva >= s.vaddr + s.size) continue;
-        void* a = (void*)(s.va + (rva - s.vaddr));
-        if (s.exec) return a;
-        if (!any) any = a;
-    }
-    return any;
-}
-
-struct Touch {
-    int32_t finger;
-    float px, py, rx, ry, dx, dy;
-    float timedelta;
-    int32_t tapcount;
-    int32_t phase;
-    int32_t type;
-    float pressure;
-    float maxpressure;
-    float radius;
-    float radiusvar;
-    float altangle;
-    float azangle;
-    float pad[16];
-};
-
-static int (*touch_count_fn)();
-static struct Touch (*get_touch_fn)(int);
-
-static bool touch_init() {
-    il2cpp::init_api(g_base);
-    if (!il2cpp::domain_get || !il2cpp::domain_assembly_open || !il2cpp::assembly_get_image ||
-        !il2cpp::class_from_name || !il2cpp::class_get_method_from_name) return false;
-    Il2CppDomain* dom = il2cpp::domain_get();
-    if (!dom) return false;
-    if (il2cpp::thread_attach) il2cpp::thread_attach(dom);
-
-    const char* asm_names[] = { "UnityEngine.CoreModule", "UnityEngine.InputLegacyModule", "UnityEngine.InputModule" };
-    for (int a = 0; a < 3; a++) {
-        Il2CppAssembly* asm_ = il2cpp::domain_assembly_open(dom, asm_names[a]);
-        if (!asm_) continue;
-        Il2CppImage* img = il2cpp::assembly_get_image(asm_);
-        if (!img) continue;
-        Il2CppClass* input = il2cpp::class_from_name(img, "UnityEngine", "Input");
-        if (!input) continue;
-        const Il2CppMethod* mc = il2cpp::class_get_method_from_name(input, "get_touchCount", 0);
-        const Il2CppMethod* mt = il2cpp::class_get_method_from_name(input, "GetTouch", 1);
-        if (!mc) mc = find_method(input, "get_touchCount");
-        if (!mt) mt = find_method(input, "GetTouch");
-        if (!mc || !mt) continue;
-        void* pc = *(void**)((uintptr_t)mc + il2cpp::offset::il2cpp_method_pointer);
-        void* pt = *(void**)((uintptr_t)mt + il2cpp::offset::il2cpp_method_pointer);
-        if (!pc || !pt) continue;
-        touch_count_fn = (int (*)())pc;
-        get_touch_fn = (struct Touch (*)(int))pt;
-        return true;
-    }
-    return false;
-}
-
-static void handle_touch() {
-    ImGuiIO& io = ImGui::GetIO();
-    if (!touch_count_fn || !get_touch_fn) return;
-    int n = touch_count_fn();
-    static bool active = false;
-    if (n <= 0) {
-        if (active) { io.MouseDown[0] = false; active = false; }
-        return;
-    }
-    for (int i = 0; i < n; i++) {
-        struct Touch t = get_touch_fn(i);
-        int ph = t.phase;
-        float x = t.px;
-        float y = (float)scr_h - t.py;
-        if (ph == 0 || ph == 1 || ph == 2) {
-            io.MousePos = ImVec2(x, y);
-            io.MouseDown[0] = true;
-            active = true;
-        } else {
-            io.MouseDown[0] = false;
-            active = false;
-        }
-    }
-}
-
-struct lf_s { const char* name; uintptr_t addr; };
-static int lf_cb(struct dl_phdr_info* i, size_t s, void* d) {
-    (void)s;
-    lf_s* f = (lf_s*)d;
-    if (i->dlpi_name && strstr(i->dlpi_name, f->name)) { f->addr = i->dlpi_addr; return 1; }
-    return 0;
-}
-static uintptr_t find_lib(const char* n) {
-    lf_s f{n, 0};
-    dl_iterate_phdr(lf_cb, &f);
-    return f.addr;
-}
-
-static uintptr_t pick_base() {
-    size_t n = 0;
-    char* buf = load_maps_full(&n);
-    if (buf) {
-        char* p = buf;
-        while (*p) {
-            char* le = p;
-            while (*le && *le != '\n') le++;
-            if (*le) *le = 0;
-            uint64_t st = 0, en = 0;
-            int k = 0;
-            while (ishex(p[k])) { st = st * 16 + (uint64_t)hexv(p[k]); k++; }
-            if (p[k] == '-') {
-                k++;
-                while (ishex(p[k])) { en = en * 16 + (uint64_t)hexv(p[k]); k++; }
-            }
-            while (p[k] == ' ') k++;
-            if (p[k] == 'r' && p[k + 3] == 'p') {
-                const char* q = p;
-                while (*q && *q != '/') q++;
-                if (*q == '/' && strstr(q, "libunity.so") && (en - st) < 0x5100000) {
-                    free(buf);
-                    return st;
+// local copy of a remote lib (same file on device), resolves symbols to remote addresses
+struct resolver{
+    uint64_t base=0;
+    std::vector<uint8_t> d;
+    std::vector<seg> S;
+    uint64_t symtab=0,strtab=0,strsz=0,nsym=0;
+    bool ok=false;
+    bool load(const std::string& path,uint64_t base_){
+        base=base_; ok=false;
+        int fd=open(path.c_str(),O_RDONLY);
+        if(fd<0) return false;
+        off_t sz=lseek(fd,0,SEEK_END); lseek(fd,0,SEEK_SET);
+        if(sz<=0){ close(fd); return false; }
+        d.resize((size_t)sz);
+        if(read(fd,d.data(),(size_t)sz)!=(ssize_t)sz){ close(fd); return false; }
+        close(fd);
+        if(d.size()<sizeof(Elf64_Ehdr)) return false;
+        Elf64_Ehdr* eh=(Elf64_Ehdr*)d.data();
+        if(memcmp(eh->e_ident,"\x7f""ELF",4)||eh->e_ident[EI_CLASS]!=ELFCLASS64) return false;
+        S.clear();
+        Elf64_Phdr* ph=(Elf64_Phdr*)(d.data()+eh->e_phoff);
+        for(int i=0;i<eh->e_phnum;i++) if(ph[i].p_type==PT_LOAD) S.push_back({ph[i].p_vaddr,ph[i].p_filesz,ph[i].p_memsz,ph[i].p_offset,ph[i].p_align,ph[i].p_flags});
+        uint64_t dyn=0,dynsz=0;
+        for(int i=0;i<eh->e_phnum;i++) if(ph[i].p_type==PT_DYNAMIC){ dyn=ph[i].p_vaddr; dynsz=ph[i].p_memsz; break; }
+        if(!dyn||!dynsz) return false;
+        Elf64_Dyn* D=(Elf64_Dyn*)(d.data()+v2o(S,dyn));
+        size_t dn=dynsz/16;
+        for(size_t i=0;i<dn;i++){
+            switch(D[i].d_tag){
+                case DT_SYMTAB: symtab=D[i].d_un.d_ptr; break;
+                case DT_STRTAB: strtab=D[i].d_un.d_ptr; break;
+                case DT_STRSZ: strsz=D[i].d_un.d_val; break;
+                case DT_HASH:{ uint32_t* h=(uint32_t*)(d.data()+v2o(S,D[i].d_un.d_ptr)); nsym=h[1]; break; }
+                case DT_GNU_HASH:{
+                    uint32_t* g=(uint32_t*)(d.data()+v2o(S,D[i].d_un.d_ptr));
+                    uint32_t nb=g[0],so=g[1],bs=g[2];
+                    uint32_t* buckets=(uint32_t*)((uint64_t)g+16+bs*8);
+                    uint32_t* chain=buckets+nb;
+                    uint32_t mx=0;
+                    for(uint32_t b=0;b<nb;b++){
+                        uint32_t ix=buckets[b];
+                        if(!ix) continue;
+                        while(1){ if(ix>mx) mx=ix; uint32_t ch=chain[ix-so]; ix++; if(ch&1) break; }
+                    }
+                    nsym=mx+1;
+                    break;
                 }
             }
-            p = le + 1;
         }
-        free(buf);
+        ok=(symtab&&strtab&&strsz);
+        return ok;
     }
-    return find_lib("libunity.so");
+    uint64_t find(const char* nm) const{
+        if(!ok) return 0;
+        size_t lim=nsym?nsym:(strsz);
+        uint64_t st_off=v2o(S,symtab);
+        uint64_t st_off2=v2o(S,strtab);
+        if(!st_off||!st_off2) return 0;
+        for(size_t i=0;i<lim;i++){
+            uint64_t eo=st_off+i*24;
+            if(eo+24>d.size()) break;
+            Elf64_Sym* s=(Elf64_Sym*)(d.data()+eo);
+            if(!s->st_name||!s->st_shndx) continue;
+            if(s->st_name>=strsz) continue;
+            const char* n=(const char*)(d.data()+st_off2+s->st_name);
+            if(!strcmp(n,nm)) return base+s->st_value;
+        }
+        return 0;
+    }
+};
+
+static std::string base_of(const std::string& p){
+    size_t k=p.find_last_of('/');
+    return k==std::string::npos?p:p.substr(k+1);
 }
 
-static void render_frame() {
-    static bool ready = false;
-    if (!ready) {
-        ImGui::CreateContext();
-        ImGuiIO& io = ImGui::GetIO();
-        io.DisplaySize = ImVec2((float)scr_w, (float)scr_h);
-        io.IniFilename = nullptr;
-        ImFontConfig fc;
-        fc.FontDataOwnedByAtlas = false;
-        io.Fonts->AddFontFromMemoryTTF(pixeloperator, sizeof(pixeloperator), 30.f, &fc, io.Fonts->GetGlyphRangesCyrillic());
-        watermark::init();
-        ImGui::StyleColorsDark();
-        ImGui_ImplOpenGL3_Init("#version 300 es");
-        ready = true;
+static void collect_libs(int pid,std::map<std::string,std::pair<uint64_t,std::string>>& out){
+    char mp[64]; snprintf(mp,64,"/proc/%d/maps",pid);
+    FILE* f=fopen(mp,"r");
+    if(!f) return;
+    char line[1024];
+    while(fgets(line,sizeof(line),f)){
+        uint64_t st=0,en=0,off=0;
+        char perms[8]={0},path[512]={0},dev[16]={0};
+        int ino=0;
+        if(sscanf(line,"%lx-%lx %7s %lx %15s %d %511s",&st,&en,perms,&off,dev,&ino,path)<7) continue;
+        if(!strstr(path,".so")) continue;
+        std::string b=base_of(path);
+        if(b.empty()) continue;
+        auto it=out.find(b);
+        if(it==out.end()) out[b]=std::make_pair(st,std::string(path));
+        else if(off==0) out[b]=std::make_pair(st,std::string(path));
     }
-    ImGuiIO& io = ImGui::GetIO();
-    if (io.DisplaySize.x != (float)scr_w || io.DisplaySize.y != (float)scr_h)
-        io.DisplaySize = ImVec2((float)scr_w, (float)scr_h);
-    ImGui_ImplOpenGL3_NewFrame();
-    handle_touch();
-    ImGui::NewFrame();
-    menu::render();
-    events::fire_render();
-    watermark::render();
-    ImGui::EndFrame();
-    ImGui::Render();
-    glViewport(0, 0, scr_w, scr_h);
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    fclose(f);
 }
 
-static EGLBoolean (*orig_swap)(EGLDisplay, EGLSurface);
-
-static EGLBoolean hk_swap(EGLDisplay d, EGLSurface s) {
-    EGLint w = 0, h = 0;
-    if (d && s) {
-        eglQuerySurface(d, s, EGL_WIDTH, &w);
-        eglQuerySurface(d, s, EGL_HEIGHT, &h);
-    }
-    if (w > 0 && h > 0) { scr_w = w; scr_h = h; }
-    std::lock_guard<std::mutex> lg(g_mtx);
-    render_frame();
-    return orig_swap(d, s);
+static uintptr_t rsym(std::vector<resolver>& R,const char* n){
+    for(size_t i=0;i<R.size();i++){ uint64_t v=R[i].find(n); if(v) return v; }
+    return 0;
 }
 
-static void* thread_main(void*) {
-    il2cpp::resolve_rva = segment_resolve_rva;
-    build_maps();
-    g_base = pick_base();
-    while (!g_base) {
-        sleep(1);
-        build_maps();
-        g_base = pick_base();
-    }
-    LOG("g_base=%llx", (unsigned long long)g_base);
-    hooking::pump();
-    void* egl = nullptr;
-    void* eh = dlopen("libEGL.so", RTLD_NOW);
-    if (eh) {
-        egl = dlsym(eh, "eglSwapBuffers");
-    }
-    if (!egl) egl = dlsym(RTLD_NEXT, "eglSwapBuffers");
-    if (!egl) egl = dlsym(RTLD_DEFAULT, "eglSwapBuffers");
-    if (egl) {
-        inline_hook(egl, (void*)hk_swap, (void**)&orig_swap);
+#define R_AARCH64_ABS64   257
+#define R_AARCH64_GLOB_DAT 1025
+#define R_AARCH64_JUMP_SLOT 1026
+#define R_AARCH64_RELATIVE 1027
+#define R_AARCH64_IRELATIVE 1032
+
+int main(int argc,char** argv){
+    if(argc<3){ logf("usage: %s <pid> <lib.so>\n",argv[0]); return 1; }
+    int pid=atoi(argv[1]);
+    const char* path=argv[2];
+    logf("[*] inj pid=%d lib=%s\n",pid,path);
+
+    int fd=open(path,O_RDONLY);
+    if(fd<0){ logf("[-] open lib fail\n"); return 1; }
+    off_t fsz=lseek(fd,0,SEEK_END); lseek(fd,0,SEEK_SET);
+    if(fsz<=0||fsz>256*1024*1024){ logf("[-] lib size bad\n"); close(fd); return 1; }
+    std::vector<uint8_t> lib((size_t)fsz);
+    if(read(fd,lib.data(),(size_t)fsz)!=(ssize_t)fsz){ close(fd); return 1; }
+    close(fd);
+
+    Elf64_Ehdr* eh=(Elf64_Ehdr*)lib.data();
+    if(memcmp(eh->e_ident,"\x7f""ELF",4)||eh->e_ident[EI_CLASS]!=ELFCLASS64||eh->e_machine!=EM_AARCH64){
+        logf("[-] not aarch64 elf\n"); return 1;
     }
 
-    while (true) {
-        sleep(2);
-        build_maps();
-        hooking::pump();
-        if (!touch_count_fn || !get_touch_fn) touch_init();
-        uint64_t new_base = pick_base();
-        if (new_base && new_base != g_base) {
-            LOG("base change %llx -> %llx, resetting hooks",
-                (unsigned long long)g_base, (unsigned long long)new_base);
-            g_base = new_base;
-            il2cpp::init_api(g_base);
-            hooking::reset();
+    std::vector<seg> S;
+    uint64_t min_v=~0ull,max_e=0;
+    Elf64_Phdr* ph=(Elf64_Phdr*)(lib.data()+eh->e_phoff);
+    for(int i=0;i<eh->e_phnum;i++){
+        if(ph[i].p_type==PT_LOAD){
+            S.push_back({ph[i].p_vaddr,ph[i].p_filesz,ph[i].p_memsz,ph[i].p_offset,ph[i].p_align,ph[i].p_flags});
+            if(ph[i].p_vaddr<min_v) min_v=ph[i].p_vaddr;
+            uint64_t e=ph[i].p_vaddr+ph[i].p_memsz;
+            if(e>max_e) max_e=e;
         }
     }
-    return nullptr;
-}
+    if(S.empty()){ logf("[-] no load segs\n"); return 1; }
+    uint64_t msize=alu(max_e-min_v);
+    logf("[+] module size 0x%llx\n",(unsigned long long)msize);
 
-extern "C" __attribute__((visibility("default"))) void payload_entry(void* base) {
-    (void)base;
-    il2cpp::resolve_rva = segment_resolve_rva;
-    pthread_t th;
-    if (pthread_create(&th, nullptr, thread_main, nullptr) == 0)
-        pthread_detach(th);
+    uint64_t dyn_va=0,dyn_sz=0;
+    for(int i=0;i<eh->e_phnum;i++) if(ph[i].p_type==PT_DYNAMIC){ dyn_va=ph[i].p_vaddr; dyn_sz=ph[i].p_memsz; break; }
+    if(!dyn_va){ logf("[-] no dynamic\n"); return 1; }
+
+    uint64_t symtab=0,strtab=0,strsz=0,nsym=0;
+    uint64_t rela=0,relasz=0,relaent=24;
+    uint64_t rel=0,relsz=0,relent=16;
+    uint64_t jmprel=0,pltrelsz=0,pltrel=0;
+    uint64_t init_fn=0,init_ar=0,init_arsz=0;
+    {
+        Elf64_Dyn* D=(Elf64_Dyn*)(lib.data()+v2o(S,dyn_va));
+        size_t dn=dyn_sz/16;
+        for(size_t i=0;i<dn;i++){
+            switch(D[i].d_tag){
+                case DT_SYMTAB: symtab=D[i].d_un.d_ptr; break;
+                case DT_STRTAB: strtab=D[i].d_un.d_ptr; break;
+                case DT_STRSZ: strsz=D[i].d_un.d_val; break;
+                case DT_HASH:{ uint32_t* h=(uint32_t*)(lib.data()+v2o(S,D[i].d_un.d_ptr)); nsym=h[1]; break; }
+                case DT_GNU_HASH:{
+                    uint32_t* g=(uint32_t*)(lib.data()+v2o(S,D[i].d_un.d_ptr));
+                    uint32_t nb=g[0],so=g[1],bs=g[2];
+                    uint32_t* buckets=(uint32_t*)((uint64_t)g+16+bs*8);
+                    uint32_t* chain=buckets+nb;
+                    uint32_t mx=0;
+                    for(uint32_t b=0;b<nb;b++){
+                        uint32_t ix=buckets[b];
+                        if(!ix) continue;
+                        while(1){ if(ix>mx) mx=ix; uint32_t ch=chain[ix-so]; ix++; if(ch&1) break; }
+                    }
+                    nsym=mx+1;
+                    break;
+                }
+                case DT_RELA: rela=D[i].d_un.d_ptr; break;
+                case DT_RELASZ: relasz=D[i].d_un.d_val; break;
+                case DT_RELAENT: relaent=D[i].d_un.d_val; break;
+                case DT_REL: rel=D[i].d_un.d_ptr; break;
+                case DT_RELSZ: relsz=D[i].d_un.d_val; break;
+                case DT_RELENT: relent=D[i].d_un.d_val; break;
+                case DT_JMPREL: jmprel=D[i].d_un.d_ptr; break;
+                case DT_PLTRELSZ: pltrelsz=D[i].d_un.d_val; break;
+                case DT_PLTREL: pltrel=D[i].d_un.d_val; break;
+                case DT_INIT: init_fn=D[i].d_un.d_ptr; break;
+                case DT_INIT_ARRAY: init_ar=D[i].d_un.d_ptr; break;
+                case DT_INIT_ARRAYSZ: init_arsz=D[i].d_un.d_val; break;
+            }
+        }
+    }
+    if(!relaent) relaent=24;
+    if(!relent) relent=16;
+
+    char memp[64]; snprintf(memp,64,"/proc/%d/mem",pid);
+    mfd=open(memp,O_RDWR);
+    if(mfd<0){ logf("[-] open /proc/%d/mem fail %s\n",pid,strerror(errno)); return 1; }
+    logf("[+] mem ok\n");
+
+    std::map<std::string,std::pair<uint64_t,std::string>> rl;
+    collect_libs(pid,rl);
+    logf("[+] remote libs %zu\n",rl.size());
+    const char* want[]={"libc.so","libdl.so","libm.so","liblog.so","libandroid.so","libEGL.so","libGLESv3.so","libGLESv2.so","libunity.so",0};
+    std::vector<resolver> res;
+    for(const char** w=want;*w;w++){
+        auto it=rl.find(*w);
+        if(it==rl.end()){ logf("[-] no remote %s\n",*w); continue; }
+        resolver r;
+        if(r.load(it->second.second,it->second.first)){
+            logf("[+] resolver %s base=%llx\n",*w,(unsigned long long)it->second.first);
+            res.push_back(std::move(r));
+        }
+    }
+
+    uintptr_t mmap_a=rsym(res,"mmap");
+    uintptr_t mprotect_a=rsym(res,"mprotect");
+    if(!mmap_a||!mprotect_a){ logf("[-] no mmap/mprotect\n"); return 1; }
+
+    uintptr_t base=rcall(pid,mmap_a,6,0,msize,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,(uintptr_t)-1,0);
+    if(base==(uintptr_t)-1||base==0){ logf("[-] remote mmap fail\n"); return 1; }
+    logf("[+] mapped at %llx\n",(unsigned long long)base);
+
+    // write segments
+    for(size_t i=0;i<S.size();i++){
+        uint64_t a=base+(S[i].va-min_v);
+        if(S[i].fsz) rwrite(a,lib.data()+S[i].off,S[i].fsz);
+        if(S[i].msz>S[i].fsz){
+            static uint8_t z[4096]={0};
+            uint64_t left=S[i].msz-S[i].fsz;
+            uint64_t p=a+S[i].fsz;
+            while(left){
+                uint64_t c=left>sizeof(z)?sizeof(z):left;
+                rwrite(p,z,c);
+                p+=c; left-=c;
+            }
+        }
+    }
+
+    // relocations
+    auto w64=[&](uint64_t a,uint64_t v){ rwrite(a,&v,8); };
+    auto w32=[&](uint64_t a,uint32_t v){ rwrite(a,&v,4); };
+    auto getS=[&](uint32_t si,uint64_t* out)->bool{
+        if(!si){ *out=0; return false; }
+        uint64_t so=v2o(S,symtab)+(uint64_t)si*24;
+        if(so+24>lib.size()) return false;
+        Elf64_Sym* s=(Elf64_Sym*)(lib.data()+so);
+        if(s->st_shndx!=SHN_UNDEF&&s->st_value){ *out=base+(s->st_value-min_v); return true; }
+        if(!s->st_name) return false;
+        const char* nm=(const char*)(lib.data()+v2o(S,strtab)+s->st_name);
+        for(size_t i=0;i<res.size();i++){ uint64_t v=res[i].find(nm); if(v){ *out=v; return true; } }
+        return false;
+    };
+    auto do_rela=[&](uint64_t r_offset,uint64_t r_info,int64_t r_addend){
+        uint32_t ty=(uint32_t)r_info;
+        uint32_t si=(uint32_t)(r_info>>32);
+        uint64_t a=base+(r_offset-min_v);
+        uint64_t Sv=0;
+        switch(ty){
+            case R_AARCH64_RELATIVE: w64(a,base+(uint64_t)r_addend); break;
+            case R_AARCH64_ABS64: if(getS(si,&Sv)) w64(a,Sv+(uint64_t)r_addend); break;
+            case R_AARCH64_GLOB_DAT:
+            case R_AARCH64_JUMP_SLOT: if(getS(si,&Sv)) w64(a,Sv); break;
+            default: break;
+        }
+    };
+    size_t nr=relaent?relasz/relaent:0;
+    for(size_t i=0;i<nr;i++){
+        Elf64_Rela* r=(Elf64_Rela*)(lib.data()+v2o(S,rela)+i*24);
+        do_rela(r->r_offset,r->r_info,r->r_addend);
+    }
+    if(pltrel==DT_RELA){
+        size_t nj=pltrelsz/24;
+        for(size_t j=0;j<nj;j++){
+            Elf64_Rela* r=(Elf64_Rela*)(lib.data()+v2o(S,jmprel)+j*24);
+            do_rela(r->r_offset,r->r_info,r->r_addend);
+        }
+    }
+    size_t nr2=relent?relsz/relent:0;
+    for(size_t i=0;i<nr2;i++){
+        Elf64_Rel* r=(Elf64_Rel*)(lib.data()+v2o(S,rel)+i*16);
+        do_rela(r->r_offset,r->r_info,0);
+    }
+    logf("[+] relocs done\n");
+
+    // mprotect segments
+    for(size_t i=0;i<S.size();i++){
+        int prot=0;
+        if(S[i].fl&PF_R) prot|=PROT_READ;
+        if(S[i].fl&PF_W) prot|=PROT_WRITE;
+        if(S[i].fl&PF_X) prot|=PROT_EXEC;
+        uint64_t a=base+(S[i].va-min_v);
+        if(prot&&prot!=(PROT_READ|PROT_WRITE)){
+            uintptr_t mr=rcall(pid,mprotect_a,3,ald(a),alu(S[i].msz),prot);
+            logf("[+] mprotect 0x%llx size 0x%llx prot 0x%x -> %llx\n",
+                (unsigned long long)ald(a),(unsigned long long)alu(S[i].msz),prot,(unsigned long long)mr);
+        }
+    }
+
+    // run init
+    if(init_fn){
+        logf("[+] DT_INIT\n");
+        rcall(pid,base+(init_fn-min_v),1,base);
+    }
+    if(init_ar&&init_arsz){
+        size_t n=init_arsz/8;
+        for(size_t i=0;i<n;i++){
+            uint64_t fp=0;
+            if(rread(base+(init_ar-min_v)+i*8,&fp,8)==8&&fp){
+                logf("[+] init_array[%zu]=%llx\n",i,(unsigned long long)fp);
+                rcall(pid,fp,1,base);
+            }
+        }
+    }
+
+    // payload_entry
+    uintptr_t entry=0;
+    {
+        uint64_t so=v2o(S,symtab);
+        size_t lim=nsym?nsym:(strsz);
+        for(size_t i=0;i<lim;i++){
+            Elf64_Sym* s=(Elf64_Sym*)(lib.data()+so+i*24);
+            if(!s->st_name||!s->st_shndx) continue;
+            const char* nm=(const char*)(lib.data()+v2o(S,strtab)+s->st_name);
+            if(!strcmp(nm,"payload_entry")){ entry=base+(s->st_value-min_v); break; }
+        }
+    }
+    if(entry){
+        logf("[+] payload_entry %llx\n",(unsigned long long)entry);
+        rcall(pid,entry,1,base);
+        logf("[+] injected\n");
+    }else{
+        logf("[-] payload_entry not found\n");
+    }
+
+    close(mfd);
+    return 0;
 }
