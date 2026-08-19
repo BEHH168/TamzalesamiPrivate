@@ -1,0 +1,14 @@
+# exported by https://3dviewer.net
+newmtl aaa.002
+Kd 0.8 0.8 0.8
+d 1
+Ka 0 0 0
+Ks 0.8 0.8 0.8
+Ns 250
+newmtl Material
+Kd 0.8 0.8 0.8
+d 1
+Ka 0 0 0
+Ks 0.8 0.8 0.8
+Ns 250
+map_Kd base_color_texture.png
